@@ -229,9 +229,16 @@ export function createSplat(config: SplatConfig): SplatEncoder {
         lit: probeLit.createView({ dimension: "2d-array" }),
     };
 
-    const faceUniformBuffers = Array.from({ length: PROBE_LAYERS }, () =>
-        device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
-    );
+    // One large uniform buffer for all face uniforms, accessed via dynamic offsets.
+    // Stride must be a multiple of minUniformBufferOffsetAlignment (typically 256 B).
+    const FACE_UNIFORM_BYTES = 96; // 24 floats × 4 bytes
+    const FACE_UNIFORM_ALIGN = device.limits.minUniformBufferOffsetAlignment;
+    const FACE_UNIFORM_STRIDE = Math.ceil(FACE_UNIFORM_BYTES / FACE_UNIFORM_ALIGN) * FACE_UNIFORM_ALIGN;
+    const FACE_UNIFORM_STRIDE_F32 = FACE_UNIFORM_STRIDE >> 2;
+    const faceUniformBuffer = device.createBuffer({
+        size: PROBE_LAYERS * FACE_UNIFORM_STRIDE,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
 
     const probeParamsBuffer = device.createBuffer({
         size: 128,
@@ -257,6 +264,14 @@ export function createSplat(config: SplatConfig): SplatEncoder {
         size: FACE_TEXELS * PROBE_LAYERS * 4,
         usage: GPUBufferUsage.STORAGE,
     });
+
+    // Compact list of active layer indices uploaded once per frame; lighting dispatch uses
+    // only as many Z-slices as there are genuinely active (probe-active AND face-masked) layers.
+    const activeLayerIndexBuffer = device.createBuffer({
+        size: PROBE_LAYERS * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
 
     const OCT_ENCODE_WGSL = /* wgsl */ `
 fn octEncode(n: vec3<f32>) -> vec2<f32> {
@@ -389,7 +404,7 @@ fn octEncode(n: vec3<f32>) -> vec2<f32> {
             {
                 binding: 0,
                 visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
-                buffer: { type: "uniform" },
+                buffer: { type: "uniform", hasDynamicOffset: true },
             },
         ],
     });
@@ -448,12 +463,11 @@ fn octEncode(n: vec3<f32>) -> vec2<f32> {
         depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
     });
 
-    const faceBindGroups = faceUniformBuffers.map((buf) =>
-        device.createBindGroup({
-            layout: gbufferLayout,
-            entries: [{ binding: 0, resource: { buffer: buf } }],
-        }),
-    );
+    // Single bind group for all face uniforms — offset supplied as dynamic offset at draw time
+    const faceBindGroup = device.createBindGroup({
+        layout: gbufferLayout,
+        entries: [{ binding: 0, resource: { buffer: faceUniformBuffer, size: FACE_UNIFORM_BYTES } }],
+    });
 
     // Emissive G-buffer (orb + wisps)
     const orbLayout = device.createBindGroupLayout({
@@ -595,6 +609,7 @@ struct LightingParams {
             @group(0) @binding(10) var<uniform> scene: SkyScene;
 
             @group(0) @binding(11) var probeEidTex: texture_2d_array<u32>;
+            @group(0) @binding(12) var<storage, read> activeLayerIndices: array<u32>;
 
             ${BVH_WGSL}
             ${OKLAB_WGSL}
@@ -663,32 +678,24 @@ struct LightingParams {
             @compute @workgroup_size(8, 8, 1)
             fn main(@builtin(global_invocation_id) gid: vec3u) {
                 let size = ${PROBE_SIZE}u;
-                if (gid.x >= size || gid.y >= size || gid.z >= ${PROBE_LAYERS}u) { return; }
+                if (gid.x >= size || gid.y >= size) { return; }
 
-                let probeIdx = gid.z / 6u;
-                let face = gid.z % 6u;
-
-                if ((lp.activeProbes & (1u << probeIdx)) == 0u) { return; }
+                // gid.z is a compact index into the pre-built active-layer list.
+                // Only layers where the probe is active AND the face is in the mask are included,
+                // so no early-return branches or sky-fill work for masked faces are needed here.
+                let layer = activeLayerIndices[gid.z];
+                let probeIdx = layer / 6u;
+                let face = layer % 6u;
 
                 var origin: vec3f;
-                var faceMask: u32;
                 switch (probeIdx) {
-                    case 0u: { origin = lp.origin0; faceMask = lp.faceMask0; }
-                    case 1u: { origin = lp.origin1; faceMask = lp.faceMask1; }
-                    default: { origin = lp.origin2; faceMask = lp.faceMask2; }
-                }
-
-                if ((faceMask & (1u << face)) == 0u) {
-                    let uv_u = (f32(gid.x) + 0.5) / f32(size);
-                    let uv_v = (f32(gid.y) + 0.5) / f32(size);
-                    let dir = faceUVtoDir(face, uv_u, uv_v);
-                    let skyColor = posterize(sampleSky(dir));
-                    textureStore(cubeLitTex, vec2u(gid.x, gid.y), gid.z, vec4f(skyColor, 1.0));
-                    return;
+                    case 0u: { origin = lp.origin0; }
+                    case 1u: { origin = lp.origin1; }
+                    default: { origin = lp.origin2; }
                 }
 
                 let coords = vec2i(vec2u(gid.x, gid.y));
-                let radial = textureLoad(cubeRadialTex, coords, gid.z, 0).r;
+                let radial = textureLoad(cubeRadialTex, coords, layer, 0).r;
 
                 let uv_u = (f32(gid.x) + 0.5) / f32(size);
                 let uv_v = (f32(gid.y) + 0.5) / f32(size);
@@ -696,17 +703,17 @@ struct LightingParams {
 
                 if (radial >= 0.999) {
                     let skyColor = posterize(sampleSky(dir));
-                    textureStore(cubeLitTex, vec2u(gid.x, gid.y), gid.z, vec4f(skyColor, 1.0));
+                    textureStore(cubeLitTex, vec2u(gid.x, gid.y), layer, vec4f(skyColor, 1.0));
                     return;
                 }
 
-                let albedoSample = textureLoad(cubeAlbedoTex, coords, gid.z, 0);
+                let albedoSample = textureLoad(cubeAlbedoTex, coords, layer, 0);
                 if (albedoSample.a < 0.5) {
-                    textureStore(cubeLitTex, vec2u(gid.x, gid.y), gid.z, vec4f(posterize(albedoSample.rgb), 1.0));
+                    textureStore(cubeLitTex, vec2u(gid.x, gid.y), layer, vec4f(posterize(albedoSample.rgb), 1.0));
                     return;
                 }
                 let albedo = albedoSample.rgb;
-                let normalSample = textureLoad(cubeNormalTex, coords, gid.z, 0);
+                let normalSample = textureLoad(cubeNormalTex, coords, layer, 0);
                 let normal = decodeNormal(normalSample.rg);
                 let emissive = normalSample.a;
 
@@ -719,7 +726,7 @@ struct LightingParams {
 
                 if (probeIdx >= 1u) {
                     let viewDir = normalize(origin - worldPos);
-                    let edge = detectEdge(vec2u(gid.x, gid.y), gid.z, size, radial, viewDir);
+                    let edge = detectEdge(vec2u(gid.x, gid.y), layer, size, radial, viewDir);
                     if (edge != 0) {
                         let bandSize = 1.0 / BANDS;
                         var lab = toOKLab(color);
@@ -729,7 +736,7 @@ struct LightingParams {
                     }
                 }
                 let posterized = posterize(color);
-                textureStore(cubeLitTex, vec2u(gid.x, gid.y), gid.z, vec4f(posterized, 1.0));
+                textureStore(cubeLitTex, vec2u(gid.x, gid.y), layer, vec4f(posterized, 1.0));
             }
         `,
     });
@@ -784,6 +791,11 @@ struct LightingParams {
                 visibility: GPUShaderStage.COMPUTE,
                 texture: { sampleType: "uint", viewDimension: "2d-array" },
             },
+            {
+                binding: 12,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "read-only-storage" },
+            },
         ],
     });
 
@@ -807,6 +819,7 @@ struct LightingParams {
             { binding: 9, resource: { buffer: config.skyBuffer } },
             { binding: 10, resource: { buffer: config.sceneBuffer } },
             { binding: 11, resource: arrayViews.eid },
+            { binding: 12, resource: { buffer: activeLayerIndexBuffer } },
         ],
     });
 
@@ -1374,11 +1387,24 @@ fn dirToFaceUVf(dir: vec3f) -> vec3f {
     });
 
     const proj = cubePerspective(NEAR, FAR);
-    const faceUniformData = new Float32Array(24);
+    // Staging for all face uniforms — written once per frame then uploaded in one writeBuffer call
+    const faceUniformStaging = new Float32Array(PROBE_LAYERS * FACE_UNIFORM_STRIDE_F32);
     const ts = createTransitionState();
     const probeData = new Float32Array(32);
     const indirectData = new Uint32Array([6, 0, 0, 0]);
     const lightingParamsData = new Float32Array(32);
+    // Persistent alias — avoids creating a new Uint32Array view every frame
+    const lightingParamsU32 = new Uint32Array(lightingParamsData.buffer);
+    // Reusable scratch buffers to eliminate per-frame heap allocations in encode()
+    // Compact list of active face layers built each frame; length = activeLayerCount
+    const activeLayerIndices = new Uint32Array(PROBE_LAYERS);
+    const facePlanes: (number[][] | null)[] = new Array(PROBE_LAYERS).fill(null);
+    const splatSceneData = new Float32Array(20);
+    const origins: [[number, number, number], [number, number, number], [number, number, number]] = [
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0],
+    ];
     let probeFrame = 0;
 
     function getActiveProbes(frame: number, crossfading: boolean): number {
@@ -1403,14 +1429,15 @@ fn dirToFaceUVf(dir: vec3f) -> vec3f {
             const gridMask = computeFaceMask(fx, fy, fz, GRID_CULL_COS);
             const prevMask = crossfading ? gridMask : 0;
 
-            const origins: [number, number, number][] = [
-                [cx, cy, cz],
-                [ts.origin[0], ts.origin[1], ts.origin[2]],
-                [ts.prevOrigin[0], ts.prevOrigin[1], ts.prevOrigin[2]],
-            ];
+            // Mutate pre-allocated origins array instead of allocating new tuples each frame
+            origins[0][0] = cx; origins[0][1] = cy; origins[0][2] = cz;
+            origins[1][0] = ts.origin[0]; origins[1][1] = ts.origin[1]; origins[1][2] = ts.origin[2];
+            origins[2][0] = ts.prevOrigin[0]; origins[2][1] = ts.prevOrigin[1]; origins[2][2] = ts.prevOrigin[2];
+
+            // Reset reusable frustum cache without allocating a new array each frame
+            for (let i = 0; i < PROBE_LAYERS; i++) facePlanes[i] = null;
 
             // Upload face uniforms and compute frustum planes for each probe
-            const facePlanes: (number[][] | null)[] = new Array(PROBE_LAYERS).fill(null);
             for (let p = 0; p < 3; p++) {
                 if (!(activeProbes & (1 << p))) continue;
                 let mask: number;
@@ -1441,18 +1468,20 @@ fn dirToFaceUVf(dir: vec3f) -> vec3f {
                     vp[5] *= -1;
                     vp[9] *= -1;
                     vp[13] *= -1;
-                    faceUniformData.set(vp, 0);
-                    faceUniformData[16] = ox;
-                    faceUniformData[17] = oy;
-                    faceUniformData[18] = oz;
-                    faceUniformData[19] = NEAR;
-                    faceUniformData[20] = 0;
-                    faceUniformData[21] = 0;
-                    faceUniformData[22] = 0;
-                    faceUniformData[23] = FAR;
-                    device.queue.writeBuffer(faceUniformBuffers[base + i], 0, faceUniformData);
+                    const stagingBase = (base + i) * FACE_UNIFORM_STRIDE_F32;
+                    faceUniformStaging.set(vp, stagingBase);
+                    faceUniformStaging[stagingBase + 16] = ox;
+                    faceUniformStaging[stagingBase + 17] = oy;
+                    faceUniformStaging[stagingBase + 18] = oz;
+                    faceUniformStaging[stagingBase + 19] = NEAR;
+                    faceUniformStaging[stagingBase + 20] = 0;
+                    faceUniformStaging[stagingBase + 21] = 0;
+                    faceUniformStaging[stagingBase + 22] = 0;
+                    faceUniformStaging[stagingBase + 23] = FAR;
                 }
             }
+            // One upload for all active face uniforms instead of one per face
+            device.queue.writeBuffer(faceUniformBuffer, 0, faceUniformStaging);
 
             const { grass, stones, orbs } = config.meshAABBs;
 
@@ -1505,9 +1534,11 @@ fn dirToFaceUVf(dir: vec3f) -> vec3f {
                         },
                     });
 
+                    const dynamicOffset = layer * FACE_UNIFORM_STRIDE;
+
                     if (aabbInFrustum(planes, grass)) {
                         pass.setPipeline(grassGbufferPipeline);
-                        pass.setBindGroup(0, faceBindGroups[layer]);
+                        pass.setBindGroup(0, faceBindGroup, [dynamicOffset]);
                         pass.setVertexBuffer(0, config.vertexBuffer);
                         pass.setIndexBuffer(config.indexBuffer, "uint16");
                         pass.drawIndexed(config.indexCount);
@@ -1515,7 +1546,7 @@ fn dirToFaceUVf(dir: vec3f) -> vec3f {
 
                     if (aabbInFrustum(planes, stones)) {
                         pass.setPipeline(stoneGbufferPipeline);
-                        pass.setBindGroup(0, faceBindGroups[layer]);
+                        pass.setBindGroup(0, faceBindGroup, [dynamicOffset]);
                         pass.setVertexBuffer(0, config.stoneVertexBuffer);
                         pass.setIndexBuffer(config.stoneIndexBuffer, "uint16");
                         pass.drawIndexed(config.stoneIndexCount);
@@ -1523,7 +1554,7 @@ fn dirToFaceUVf(dir: vec3f) -> vec3f {
 
                     if (aabbInFrustum(planes, orbs)) {
                         pass.setPipeline(emissiveGbufferPipeline);
-                        pass.setBindGroup(0, faceBindGroups[layer]);
+                        pass.setBindGroup(0, faceBindGroup, [dynamicOffset]);
                         pass.setVertexBuffer(0, config.orbVertexBuffer);
                         pass.setIndexBuffer(config.orbIndexBuffer, "uint16");
                         for (let j = 0; j < 4; j++) {
@@ -1552,31 +1583,50 @@ fn dirToFaceUVf(dir: vec3f) -> vec3f {
             lightingParamsData[12] = params.ambient[0];
             lightingParamsData[13] = params.ambient[1];
             lightingParamsData[14] = params.ambient[2];
-            new Uint32Array(lightingParamsData.buffer)[15] = eyeMask;
+            // Use pre-allocated Uint32Array alias — no transient typed-array views per frame
+            lightingParamsU32[15] = eyeMask;
             lightingParamsData[16] = ts.origin[0];
             lightingParamsData[17] = ts.origin[1];
             lightingParamsData[18] = ts.origin[2];
-            new Uint32Array(lightingParamsData.buffer)[19] = gridMask;
+            lightingParamsU32[19] = gridMask;
             lightingParamsData[20] = ts.prevOrigin[0];
             lightingParamsData[21] = ts.prevOrigin[1];
             lightingParamsData[22] = ts.prevOrigin[2];
-            new Uint32Array(lightingParamsData.buffer)[23] = prevMask;
-            new Uint32Array(lightingParamsData.buffer)[24] = activeProbes;
-            new Uint32Array(lightingParamsData.buffer)[25] = params.pointLightCount;
+            lightingParamsU32[23] = prevMask;
+            lightingParamsU32[24] = activeProbes;
+            lightingParamsU32[25] = params.pointLightCount;
             device.queue.writeBuffer(lightingParamsBuffer, 0, lightingParamsData);
+
+            // Build compact list of layers that are both probe-active and face-masked.
+            // Masked-out faces produce no vis entries (cull skips them), so lighting work
+            // for those layers is entirely wasted — skip them at the dispatch level.
+            let activeLayerCount = 0;
+            for (let probeIdx = 0; probeIdx < 3; probeIdx++) {
+                if (!(activeProbes & (1 << probeIdx))) continue;
+                const probeMask = probeIdx === PROBE_EYE ? eyeMask
+                    : probeIdx === PROBE_GRID ? gridMask
+                    : prevMask;
+                for (let face = 0; face < 6; face++) {
+                    if (probeMask & (1 << face)) {
+                        activeLayerIndices[activeLayerCount++] = probeIdx * 6 + face;
+                    }
+                }
+            }
+            device.queue.writeBuffer(activeLayerIndexBuffer, 0, activeLayerIndices, 0, activeLayerCount);
+
+            const wg = Math.ceil(PROBE_SIZE / 8);
 
             const computePass = encoder.beginComputePass();
             computePass.setPipeline(lightingPipeline);
             computePass.setBindGroup(0, lightingBindGroup);
-            const wg = Math.ceil(PROBE_SIZE / 8);
-            computePass.dispatchWorkgroups(wg, wg, prevMask > 0 ? PROBE_LAYERS : 12);
+            computePass.dispatchWorkgroups(wg, wg, activeLayerCount);
             computePass.end();
 
             // Edge mask compute
             const edgeMaskPass = encoder.beginComputePass();
             edgeMaskPass.setPipeline(edgeMaskPipeline);
             edgeMaskPass.setBindGroup(0, edgeMaskBindGroup);
-            edgeMaskPass.dispatchWorkgroups(wg, wg, PROBE_LAYERS);
+            edgeMaskPass.dispatchWorkgroups(wg, wg, prevMask > 0 ? PROBE_LAYERS : 12);
             edgeMaskPass.end();
 
             // Probe params
@@ -1607,11 +1657,10 @@ fn dirToFaceUVf(dir: vec3f) -> vec3f {
             const cullPass = encoder.beginComputePass();
             cullPass.setPipeline(cullPipeline);
             cullPass.setBindGroup(0, cullBindGroup);
-            cullPass.dispatchWorkgroups(Math.ceil(FACE_TEXELS / 64), PROBE_LAYERS);
+            cullPass.dispatchWorkgroups(Math.ceil(FACE_TEXELS / 64), prevMask > 0 ? PROBE_LAYERS : 12);
             cullPass.end();
 
-            // Upload splat scene buffer (viewProj + cameraPos)
-            const splatSceneData = new Float32Array(20);
+            // Upload splat scene buffer (viewProj + cameraPos) — reuse pre-allocated array
             splatSceneData.set(viewProj, 0);
             splatSceneData[16] = cx;
             splatSceneData[17] = cy;
@@ -1656,13 +1705,14 @@ fn dirToFaceUVf(dir: vec3f) -> vec3f {
             probeEid.destroy();
             probeDepth.destroy();
             probeLit.destroy();
-            for (const buf of faceUniformBuffers) buf.destroy();
+            faceUniformBuffer.destroy();
             probeParamsBuffer.destroy();
             indirectArgsBuffer.destroy();
             visibilityBuffer.destroy();
             splatSceneBuffer.destroy();
             lightingParamsBuffer.destroy();
             edgeMaskBuffer.destroy();
+            activeLayerIndexBuffer.destroy();
         },
     };
 }
