@@ -4,6 +4,7 @@
   <a href="https://dylanebert.com/texel-splatting"><img src="https://img.shields.io/badge/arXiv-coming_soon-b31b1b.svg" alt="arXiv"></a>
   <a href="https://dylanebert.com/texel-splatting"><img src="https://img.shields.io/badge/project-live-4285F4.svg" alt="Project"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-5b9a41.svg" alt="License"></a>
+  <a href="https://ko-fi.com/individualkex"><img src="https://img.shields.io/badge/Ko--fi-support-ff5e5b?logo=ko-fi" alt="Ko-fi"></a>
 </p>
 
 ![Three views of a stone circle rendered with texel splatting](hero.jpg)
