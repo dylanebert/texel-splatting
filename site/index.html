@@ -20,6 +20,16 @@ h1 { font-family: "Outfit", sans-serif; font-size: 40px; font-weight: 500; color
 .description { font-size: 15px; color: #9a9088; margin-bottom: 36px; }
 .player-wrap { width: 100%; text-align: left; }
 .player { width: 100%; aspect-ratio: 16/9; border: 1px solid rgba(255,255,255,0.08); border-radius: 3px 3px 0 0; background: #0c0a09; display: block; }
+.player[hidden] { display: none; }
+.player-poster { width: 100%; aspect-ratio: 16/9; border: 1px solid rgba(255,255,255,0.08); border-radius: 3px 3px 0 0; background: #0c0a09; display: flex; align-items: center; justify-content: center; padding: 0; cursor: pointer; font: inherit; color: inherit; transition: background 0.15s; }
+.player-poster:hover { background: #131110; }
+.player-poster:disabled { cursor: default; background: #0c0a09; }
+.poster-inner { display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; padding: 0 20px; }
+.poster-inner svg { color: #9a9088; transition: color 0.15s; }
+.player-poster:hover .poster-inner svg { color: #ebe6df; }
+.poster-label { font-size: 14px; color: #d4cdc4; }
+.poster-note { font-size: 12px; color: #9a9088; }
+.poster-note a { color: #9a9088; }
 .player-bar { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; background: #141210; border: 1px solid rgba(255,255,255,0.08); border-top: none; border-radius: 0 0 3px 3px; font-size: 12px; color: #706860; }
 .player-status { display: flex; align-items: center; gap: 6px; }
 .player-status .dot { width: 6px; height: 6px; border-radius: 50%; background: #5b9a41; }
@@ -68,9 +78,16 @@ ol.references a { color: #9a9088; word-break: break-all; }
 <img class="hero" id="fig-hero" src="hero.jpg" alt="Three views of a stone circle rendered with texel splatting">
 <p class="description">Perspective-stable 3D pixel art. Render into cubemaps from fixed origins, splat to screen as world-space quads.</p>
 <div class="player-wrap" id="player-wrap">
-<iframe class="player" id="player" src="demo/" allowfullscreen></iframe>
+<button class="player-poster" id="player-poster">
+<span class="poster-inner">
+<svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M10 8.5l6 3.5-6 3.5z" fill="currentColor" stroke="none"/></svg>
+<span class="poster-label" id="poster-label">Run the interactive demo</span>
+<span class="poster-note" id="poster-note">WebGPU, loads on click</span>
+</span>
+</button>
+<iframe class="player" id="player" allowfullscreen loading="lazy" hidden></iframe>
 <div class="player-bar">
-<span class="player-status" id="player-status"><span class="dot"></span><span id="status-text">loading</span></span>
+<span class="player-status" id="player-status"><span class="dot"></span><span id="status-text">idle</span></span>
 <button id="fullscreen-btn" title="Open in new tab">
 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6M15 3h6v6M10 14L21 3"/>
@@ -292,8 +309,10 @@ class="uri">https://sites.google.com/view/propixelizer/</a></li>
 </main>
 
 <script>
-const wrap = document.getElementById("player-wrap");
 const player = document.getElementById("player");
+const poster = document.getElementById("player-poster");
+const posterLabel = document.getElementById("poster-label");
+const posterNote = document.getElementById("poster-note");
 const status = document.getElementById("player-status");
 const statusText = document.getElementById("status-text");
 const fsBtn = document.getElementById("fullscreen-btn");
@@ -302,12 +321,18 @@ if (!navigator.gpu) {
     statusText.textContent = "WebGPU not supported";
     fsBtn.disabled = true;
     fsBtn.style.opacity = "0.3";
-    player.src = "";
-    player.srcdoc = '<html style="height:100%"><body style="background:#0c0a09;color:#706860;font:14px system-ui;display:flex;align-items:center;justify-content:center;height:100%;margin:0;overflow:hidden;text-align:center;padding:0 20px 30px"><div>WebGPU is required.<br><a href="https://caniuse.com/webgpu" style="color:#9a9088" target="_blank">Check browser support</a></div></body></html>';
+    poster.disabled = true;
+    poster.querySelector("svg").remove();
+    posterLabel.textContent = "WebGPU is required";
+    posterNote.innerHTML = '<a href="https://caniuse.com/webgpu" target="_blank" rel="noopener">Check browser support</a>';
 } else {
-    function onLoad() { statusText.textContent = "running"; }
-    player.addEventListener("load", onLoad);
-    if (player.contentDocument?.readyState === "complete") onLoad();
+    poster.addEventListener("click", () => {
+        poster.remove();
+        player.hidden = false;
+        statusText.textContent = "loading";
+        player.addEventListener("load", () => { statusText.textContent = "running"; }, { once: true });
+        player.src = "demo/";
+    }, { once: true });
 }
 fsBtn.addEventListener("click", () => { window.open("demo/", "_blank"); });
 document.getElementById("copy-btn").addEventListener("click", function() {
