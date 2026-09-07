@@ -24,6 +24,31 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install
       - run: bun run build
+      # `site/index.html` is the served landing page but not a Vite input (Vite's entry is the
+      # repo-root `index.html`, which builds the demo bundle the page embeds in an iframe), so the
+      # build cannot fill the RUM version token `harness/site-rum.ts` stamped into it. Do it here,
+      # on the disposable CI checkout, with the same commit the map upload publishes under.
+      - name: Stamp the RUM build version
+        run: sed -i "s|__SITE_RUM_VERSION__|${GITHUB_SHA}|g" site/index.html
+      # Fail closed: a served page still carrying the placeholder would report a literal
+      # `__SITE_RUM_VERSION__` as its version and match no uploaded map.
+      - name: Check the RUM build version was filled
+        run: |
+            if grep -q "__SITE_RUM_VERSION__" site/index.html; then
+              echo "RUM version placeholder survived the build in site/index.html" >&2
+              exit 1
+            fi
+      # Datadog RUM reports minified stacks. Error Tracking un-minifies one only when a map was
+      # uploaded under the same service and version the page reported, so `github.sha` is both the
+      # `--release-version` here and the `version` the build wrote into `DD_RUM.init`.
+      - name: Upload source maps to Datadog
+        run: bunx @datadog/datadog-ci@5.23.0 sourcemaps upload site/demo --service texel-splatting --release-version ${{ github.sha }} --minified-path-prefix https://dylanebert.com/texel-splatting/demo/
+        env:
+            DD_API_KEY: ${{ secrets.DD_API_KEY }}
+      # `build.sourcemap: "hidden"` leaves no `//# sourceMappingURL` pointing at these, but publishing
+      # them anyway would put the unminified source on dylanebert.com. Datadog has them; drop them.
+      - name: Drop source maps from the published site
+        run: find site/demo -name '*.map' -delete
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
