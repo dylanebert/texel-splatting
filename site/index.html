@@ -343,5 +343,18 @@ document.getElementById("copy-btn").addEventListener("click", function() {
 </script>
 <script data-goatcounter="https://dylanebert.goatcounter.com/count"
         async src="//gc.zgo.at/count.js"></script>
+<!-- site-rum: datadog rum -->
+<script>
+(function(h,o,u,n,d) {
+    h=h[d]=h[d]||{q:[],onReady:function(c){h.q.push(c)}}
+    d=o.createElement(u);d.async=1;d.src=n;d.crossOrigin='anonymous'
+    n=o.getElementsByTagName(u)[0];n.parentNode.insertBefore(d,n)
+})(window,document,'script','https://www.datadoghq-browser-agent.com/us1/v6/datadog-rum.js','DD_RUM')
+window.DD_RUM.onReady(function() {
+    var ddEnv=/(^|\.)dylanebert\.com$/.test(location.hostname)?'prod':'local';
+    window.DD_RUM.init(Object.assign({env:ddEnv},{"applicationId":"a5ffefd9-8f32-49dd-b8ae-ff31988e6bfe","clientToken":"pube2bd4a743b9fd4d05457e14b56fa53c5","site":"datadoghq.com","service":"texel-splatting","sessionSampleRate":100,"trackLongTasks":true,"sessionReplaySampleRate":0,"version":"__SITE_RUM_VERSION__"}));
+});
+</script>
+<!-- /site-rum -->
 </body>
 </html>
