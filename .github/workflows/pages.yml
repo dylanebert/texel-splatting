@@ -44,7 +44,7 @@ jobs:
       - name: Upload source maps to Datadog
         run: bunx @datadog/datadog-ci@5.23.0 sourcemaps upload site/demo --service texel-splatting --release-version ${{ github.sha }} --minified-path-prefix https://dylanebert.com/texel-splatting/demo/
         env:
-            DD_API_KEY: ${{ secrets.DD_API_KEY }}
+            DATADOG_API_KEY: ${{ secrets.DD_API_KEY }}
       # `build.sourcemap: "hidden"` leaves no `//# sourceMappingURL` pointing at these, but publishing
       # them anyway would put the unminified source on dylanebert.com. Datadog has them; drop them.
       - name: Drop source maps from the published site
